@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -12,20 +14,20 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	cnpgv1 "github.com/cloudnative-pg/api/pkg/api/v1"
 	olsv1alpha1 "github.com/openshift/lightspeed-operator/api/v1alpha1"
 )
 
 func (r *OLSConfigReconciler) reconcilePostgresServer(ctx context.Context, olsconfig *olsv1alpha1.OLSConfig) error {
 	r.logger.Info("reconcilePostgresServer starts")
+
+	// Validate certificate secret exists and is valid
+	err := r.validatePostgresCertificateSecret(ctx, PostgresCertsSecretName)
+	if err != nil {
+		return fmt.Errorf("certificate validation failed: %w", err)
+	}
+
 	tasks := []ReconcileTask{
-		{
-			Name: "reconcile Postgres ConfigMap",
-			Task: r.reconcilePostgresConfigMap,
-		},
-		{
-			Name: "reconcile Postgres Bootstrap Secret",
-			Task: r.reconcilePostgresBootstrapSecret,
-		},
 		{
 			Name: "reconcile Postgres Secret",
 			Task: r.reconcilePostgresSecret,
@@ -35,12 +37,8 @@ func (r *OLSConfigReconciler) reconcilePostgresServer(ctx context.Context, olsco
 			Task: r.reconcilePostgresService,
 		},
 		{
-			Name: "reconcile Postgres PVC",
-			Task: r.reconcilePostgresPVC,
-		},
-		{
-			Name: "reconcile Postgres Deployment",
-			Task: r.reconcilePostgresDeployment,
+			Name: "reconcile CloudNativePG Cluster",
+			Task: r.reconcileCloudNativePGCluster,
 		},
 		{
 			Name: "generate Postgres Network Policy",
@@ -61,67 +59,6 @@ func (r *OLSConfigReconciler) reconcilePostgresServer(ctx context.Context, olsco
 	return nil
 }
 
-func (r *OLSConfigReconciler) reconcilePostgresDeployment(ctx context.Context, cr *olsv1alpha1.OLSConfig) error {
-	desiredDeployment, err := r.generatePostgresDeployment(cr)
-	if err != nil {
-		return fmt.Errorf("%s: %w", ErrGeneratePostgresDeployment, err)
-	}
-
-	existingDeployment := &appsv1.Deployment{}
-	err = r.Get(ctx, client.ObjectKey{Name: PostgresDeploymentName, Namespace: r.Options.Namespace}, existingDeployment)
-	if err != nil && errors.IsNotFound(err) {
-		updateDeploymentAnnotations(desiredDeployment, map[string]string{
-			PostgresConfigHashKey: r.stateCache[PostgresConfigHashStateCacheKey],
-			PostgresSecretHashKey: r.stateCache[PostgresSecretHashStateCacheKey],
-		})
-		updateDeploymentTemplateAnnotations(desiredDeployment, map[string]string{
-			PostgresConfigHashKey: r.stateCache[PostgresConfigHashStateCacheKey],
-			PostgresSecretHashKey: r.stateCache[PostgresSecretHashStateCacheKey],
-		})
-		r.logger.Info("creating a new OLS postgres deployment", "deployment", desiredDeployment.Name)
-		err = r.Create(ctx, desiredDeployment)
-		if err != nil {
-			return fmt.Errorf("%s: %w", ErrCreatePostgresDeployment, err)
-		}
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("%s: %w", ErrGetPostgresDeployment, err)
-	}
-
-	err = r.updatePostgresDeployment(ctx, existingDeployment, desiredDeployment)
-
-	if err != nil {
-		return fmt.Errorf("%s: %w", ErrUpdatePostgresDeployment, err)
-	}
-
-	r.logger.Info("OLS postgres deployment reconciled", "deployment", desiredDeployment.Name)
-	return nil
-}
-
-func (r *OLSConfigReconciler) reconcilePostgresPVC(ctx context.Context, cr *olsv1alpha1.OLSConfig) error {
-
-	if cr.Spec.OLSConfig.Storage == nil {
-		return nil
-	}
-	pvc, err := r.generatePostgresPVC(cr)
-	if err != nil {
-		return fmt.Errorf("%s: %w", ErrGeneratePostgresPVC, err)
-	}
-
-	foundPVC := &corev1.PersistentVolumeClaim{}
-	err = r.Get(ctx, client.ObjectKey{Name: PostgresPVCName, Namespace: r.Options.Namespace}, foundPVC)
-	if err != nil && errors.IsNotFound(err) {
-		err = r.Create(ctx, pvc)
-		if err != nil {
-			return fmt.Errorf("%s: %w", ErrCreatePostgresPVC, err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("%s: %w", ErrGetPostgresPVC, err)
-	}
-	r.logger.Info("OLS postgres PVC reconciled", "pvc", pvc.Name)
-	return nil
-}
-
 func (r *OLSConfigReconciler) reconcilePostgresService(ctx context.Context, cr *olsv1alpha1.OLSConfig) error {
 	service, err := r.generatePostgresService(cr)
 	if err != nil {
@@ -139,46 +76,6 @@ func (r *OLSConfigReconciler) reconcilePostgresService(ctx context.Context, cr *
 		return fmt.Errorf("%s: %w", ErrGetPostgresService, err)
 	}
 	r.logger.Info("OLS postgres service reconciled", "service", service.Name)
-	return nil
-}
-
-func (r *OLSConfigReconciler) reconcilePostgresConfigMap(ctx context.Context, cr *olsv1alpha1.OLSConfig) error {
-	configMap, err := r.generatePostgresConfigMap(cr)
-	if err != nil {
-		return fmt.Errorf("%s: %w", ErrGeneratePostgresConfigMap, err)
-	}
-
-	foundConfigMap := &corev1.ConfigMap{}
-	err = r.Get(ctx, client.ObjectKey{Name: PostgresConfigMap, Namespace: r.Options.Namespace}, foundConfigMap)
-	if err != nil && errors.IsNotFound(err) {
-		err = r.Create(ctx, configMap)
-		if err != nil {
-			return fmt.Errorf("%s: %w", ErrCreatePostgresConfigMap, err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("%s: %w", ErrGetPostgresConfigMap, err)
-	}
-	r.logger.Info("OLS postgres configmap reconciled", "configmap", configMap.Name)
-	return nil
-}
-
-func (r *OLSConfigReconciler) reconcilePostgresBootstrapSecret(ctx context.Context, cr *olsv1alpha1.OLSConfig) error {
-	secret, err := r.generatePostgresBootstrapSecret(cr)
-	if err != nil {
-		return fmt.Errorf("%s: %w", ErrGeneratePostgresBootstrapSecret, err)
-	}
-
-	foundSecret := &corev1.Secret{}
-	err = r.Get(ctx, client.ObjectKey{Name: PostgresBootstrapSecretName, Namespace: r.Options.Namespace}, foundSecret)
-	if err != nil && errors.IsNotFound(err) {
-		err = r.Create(ctx, secret)
-		if err != nil {
-			return fmt.Errorf("%s: %w", ErrCreatePostgresBootstrapSecret, err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("%s: %w", ErrGetPostgresBootstrapSecret, err)
-	}
-	r.logger.Info("OLS postgres bootstrap secret reconciled", "secret", secret.Name)
 	return nil
 }
 
@@ -271,5 +168,89 @@ func (r *OLSConfigReconciler) reconcilePostgresNetworkPolicy(ctx context.Context
 		return fmt.Errorf("%s: %w", ErrUpdatePostgresNetworkPolicy, err)
 	}
 	r.logger.Info("OLS postgres network policy reconciled", "network policy", networkPolicy.Name)
+	return nil
+}
+
+// reconcileCloudNativePGCluster reconciles the CloudNativePG cluster
+func (r *OLSConfigReconciler) reconcileCloudNativePGCluster(ctx context.Context, cr *olsv1alpha1.OLSConfig) error {
+	desiredCluster, err := r.generateCloudNativePGCluster(cr)
+	if err != nil {
+		return fmt.Errorf("failed to generate CloudNativePG cluster: %w", err)
+	}
+
+	existingCluster := &cnpgv1.Cluster{}
+	err = r.Get(ctx, client.ObjectKey{
+		Name:      "lightspeed-postgres-cluster",
+		Namespace: r.Options.Namespace,
+	}, existingCluster)
+
+	if err != nil && errors.IsNotFound(err) {
+		r.logger.Info("creating CloudNativePG cluster", "cluster", desiredCluster.Name)
+		err = r.Create(ctx, desiredCluster)
+		if err != nil {
+			return fmt.Errorf("failed to create CloudNativePG cluster: %w", err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to get CloudNativePG cluster: %w", err)
+	}
+
+	// Update cluster if needed
+	err = r.updateCloudNativePGCluster(ctx, existingCluster, desiredCluster)
+	if err != nil {
+		return fmt.Errorf("failed to update CloudNativePG cluster: %w", err)
+	}
+
+	r.logger.Info("CloudNativePG cluster reconciled", "cluster", desiredCluster.Name)
+	return nil
+}
+
+// validatePostgresCertificateSecret validates that the PostgreSQL certificate secret exists and is valid
+func (r *OLSConfigReconciler) validatePostgresCertificateSecret(ctx context.Context, secretName string) error {
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, client.ObjectKey{
+		Name:      secretName,
+		Namespace: r.Options.Namespace,
+	}, secret)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return fmt.Errorf("certificate secret %s not found - ensure OpenShift Service CA has generated it", secretName)
+		}
+		return fmt.Errorf("failed to get certificate secret %s: %w", secretName, err)
+	}
+
+	// Validate required keys exist
+	requiredKeys := []string{"tls.crt", "tls.key"}
+	for _, key := range requiredKeys {
+		if _, exists := secret.Data[key]; !exists {
+			return fmt.Errorf("required key %s not found in secret %s", key, secretName)
+		}
+	}
+
+	// Validate certificate format and expiration
+	certPEM := secret.Data["tls.crt"]
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return fmt.Errorf("failed to decode PEM certificate in secret %s", secretName)
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse certificate in secret %s: %w", secretName, err)
+	}
+
+	// Check certificate expiration (warn if less than 30 days)
+	if time.Until(cert.NotAfter) < 30*24*time.Hour {
+		r.logger.Info("PostgreSQL certificate expires soon",
+			"secret", secretName,
+			"expiry", cert.NotAfter,
+			"days_remaining", int(time.Until(cert.NotAfter).Hours()/24))
+	}
+
+	r.logger.Info("PostgreSQL certificate validation successful",
+		"secret", secretName,
+		"subject", cert.Subject.CommonName,
+		"expiry", cert.NotAfter)
+
 	return nil
 }

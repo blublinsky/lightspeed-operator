@@ -11,12 +11,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	cnpgv1 "github.com/cloudnative-pg/api/pkg/api/v1"
 	olsv1alpha1 "github.com/openshift/lightspeed-operator/api/v1alpha1"
 )
 
@@ -431,58 +431,6 @@ func (r *OLSConfigReconciler) generatePostgresNetworkPolicy(cr *olsv1alpha1.OLSC
 	return &np, nil
 }
 
-func (r *OLSConfigReconciler) storageDefaults(s *olsv1alpha1.Storage) error {
-	if s.Size.IsZero() {
-		s.Size = resource.MustParse(PostgresDefaultPVCSize)
-	}
-	if s.Class == "" {
-		var scList storagev1.StorageClassList
-		ctx := context.Background()
-		if err := r.List(ctx, &scList); err == nil {
-			for _, sc := range scList.Items {
-				if sc.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" {
-					s.Class = sc.Name
-				}
-			}
-		}
-		if s.Class == "" {
-			return fmt.Errorf("no storage class specified and no default storage class configured")
-		}
-	}
-	return nil
-}
-
-func (r *OLSConfigReconciler) generatePostgresPVC(cr *olsv1alpha1.OLSConfig) (*corev1.PersistentVolumeClaim, error) {
-
-	storage := cr.Spec.OLSConfig.Storage
-	if err := r.storageDefaults(storage); err != nil {
-		return nil, err
-	}
-
-	pvc := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      PostgresPVCName,
-			Namespace: r.Options.Namespace,
-		},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{
-				corev1.PersistentVolumeAccessMode("ReadWriteOnce"),
-			},
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: storage.Size,
-				},
-			},
-			StorageClassName: &storage.Class,
-		},
-	}
-
-	if err := controllerutil.SetControllerReference(cr, pvc, r.Scheme); err != nil {
-		return nil, err
-	}
-	return pvc, nil
-}
-
 func getDatabaseResources(cr *olsv1alpha1.OLSConfig) *corev1.ResourceRequirements {
 	if cr.Spec.OLSConfig.DeploymentConfig.DatabaseContainer.Resources != nil {
 		return cr.Spec.OLSConfig.DeploymentConfig.DatabaseContainer.Resources
@@ -498,4 +446,210 @@ func getDatabaseResources(cr *olsv1alpha1.OLSConfig) *corev1.ResourceRequirement
 	}
 
 	return defaultResources
+}
+
+// generateCloudNativePGCluster creates a CloudNativePG Cluster resource
+func (r *OLSConfigReconciler) generateCloudNativePGCluster(cr *olsv1alpha1.OLSConfig) (*cnpgv1.Cluster, error) {
+	// Set default values
+	instances := 2 // Primary + 1 standby for HA
+
+	// Get PostgreSQL configuration
+	postgresConfig := cr.Spec.OLSConfig.ConversationCache.Postgres
+
+	// Set defaults for missing values
+	if postgresConfig.User == "" {
+		postgresConfig.User = PostgresDefaultUser
+	}
+	if postgresConfig.DbName == "" {
+		postgresConfig.DbName = PostgresDefaultDbName
+	}
+	if postgresConfig.CredentialsSecret == "" {
+		postgresConfig.CredentialsSecret = PostgresSecretName
+	}
+	if postgresConfig.SharedBuffers == "" {
+		postgresConfig.SharedBuffers = PostgresSharedBuffers
+	}
+	if postgresConfig.MaxConnections == 0 {
+		postgresConfig.MaxConnections = PostgresMaxConnections
+	}
+
+	// Create CloudNativePG Cluster
+	cluster := &cnpgv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "lightspeed-postgres-cluster",
+			Namespace: r.Options.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/component":  "postgres-server",
+				"app.kubernetes.io/managed-by": "lightspeed-operator",
+				"app.kubernetes.io/name":       "lightspeed-service-postgres",
+				"app.kubernetes.io/part-of":    "openshift-lightspeed",
+			},
+		},
+		Spec: cnpgv1.ClusterSpec{
+			Instances: instances,
+			PostgresConfiguration: cnpgv1.PostgresConfiguration{
+				Parameters: map[string]string{
+					"ssl":             "on",
+					"shared_buffers":  postgresConfig.SharedBuffers,
+					"max_connections": strconv.Itoa(postgresConfig.MaxConnections),
+				},
+			},
+			Bootstrap: &cnpgv1.BootstrapConfiguration{
+				InitDB: &cnpgv1.BootstrapInitDB{
+					Database: postgresConfig.DbName,
+					Owner:    postgresConfig.User,
+					Secret: &cnpgv1.LocalObjectReference{
+						Name: postgresConfig.CredentialsSecret,
+					},
+				},
+			},
+			StorageConfiguration: cnpgv1.StorageConfiguration{
+				Size:         getStorageSizeString(cr),
+				StorageClass: getStorageClass(cr),
+			},
+			// Use custom certificate secret
+			Certificates: &cnpgv1.CertificatesConfiguration{
+				ServerTLSSecret: PostgresCertsSecretName,
+			},
+		},
+	}
+
+	// Add resource requirements if specified
+	if cr.Spec.OLSConfig.DeploymentConfig.DatabaseContainer.Resources != nil {
+		cluster.Spec.Resources = *cr.Spec.OLSConfig.DeploymentConfig.DatabaseContainer.Resources
+	} else {
+		// Set default resources
+		cluster.Spec.Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("30m"),
+				corev1.ResourceMemory: resource.MustParse("300Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("2Gi"),
+			},
+		}
+	}
+
+	// Add node selector if specified
+	if cr.Spec.OLSConfig.DeploymentConfig.DatabaseContainer.NodeSelector != nil {
+		cluster.Spec.Affinity.NodeAffinity = &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{
+								Key:      "kubernetes.io/os",
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{"linux"},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	// Add tolerations if specified
+	if cr.Spec.OLSConfig.DeploymentConfig.DatabaseContainer.Tolerations != nil {
+		// CloudNativePG doesn't have direct tolerations field, we'll need to use affinity
+		// For now, we'll skip this as it requires more complex configuration
+	}
+
+	// Set controller reference
+	if err := controllerutil.SetControllerReference(cr, cluster, r.Scheme); err != nil {
+		return nil, fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
+	return cluster, nil
+}
+
+// getStorageSizeString returns the storage size as a string from the OLSConfig or default
+func getStorageSizeString(cr *olsv1alpha1.OLSConfig) string {
+	if cr.Spec.OLSConfig.Storage != nil && !cr.Spec.OLSConfig.Storage.Size.IsZero() {
+		return cr.Spec.OLSConfig.Storage.Size.String()
+	}
+	return PostgresDefaultPVCSize
+}
+
+// getStorageClass returns the storage class from the OLSConfig or nil
+func getStorageClass(cr *olsv1alpha1.OLSConfig) *string {
+	if cr.Spec.OLSConfig.Storage != nil && cr.Spec.OLSConfig.Storage.Class != "" {
+		return &cr.Spec.OLSConfig.Storage.Class
+	}
+	return nil
+}
+
+// updateCloudNativePGCluster updates an existing CloudNativePG cluster
+func (r *OLSConfigReconciler) updateCloudNativePGCluster(ctx context.Context, existingCluster, desiredCluster *cnpgv1.Cluster) error {
+	changed := false
+
+	// Check if PostgreSQL parameters changed
+	if !mapsEqual(existingCluster.Spec.PostgresConfiguration.Parameters, desiredCluster.Spec.PostgresConfiguration.Parameters) {
+		existingCluster.Spec.PostgresConfiguration.Parameters = desiredCluster.Spec.PostgresConfiguration.Parameters
+		changed = true
+	}
+
+	// Check if instances changed
+	if existingCluster.Spec.Instances != desiredCluster.Spec.Instances {
+		existingCluster.Spec.Instances = desiredCluster.Spec.Instances
+		changed = true
+	}
+
+	// Check if resources changed
+	if !resourceRequirementsEqual(existingCluster.Spec.Resources, desiredCluster.Spec.Resources) {
+		existingCluster.Spec.Resources = desiredCluster.Spec.Resources
+		changed = true
+	}
+
+	// Check if storage changed
+	if !storageConfigurationEqual(existingCluster.Spec.StorageConfiguration, desiredCluster.Spec.StorageConfiguration) {
+		existingCluster.Spec.StorageConfiguration = desiredCluster.Spec.StorageConfiguration
+		changed = true
+	}
+
+	if changed {
+		r.logger.Info("updating CloudNativePG cluster", "name", existingCluster.Name)
+		if err := r.Update(ctx, existingCluster); err != nil {
+			return fmt.Errorf("failed to update CloudNativePG cluster: %w", err)
+		}
+	} else {
+		r.logger.Info("CloudNativePG cluster reconciliation skipped", "cluster", existingCluster.Name)
+	}
+
+	return nil
+}
+
+// Helper functions for comparison
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func resourceRequirementsEqual(a, b corev1.ResourceRequirements) bool {
+	return resourceListEqual(a.Requests, b.Requests) && resourceListEqual(a.Limits, b.Limits)
+}
+
+func resourceListEqual(a, b corev1.ResourceList) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if !v.Equal(b[k]) {
+			return false
+		}
+	}
+	return true
+}
+
+func storageConfigurationEqual(a, b cnpgv1.StorageConfiguration) bool {
+	return a.Size == b.Size &&
+		((a.StorageClass == nil && b.StorageClass == nil) ||
+			(a.StorageClass != nil && b.StorageClass != nil && *a.StorageClass == *b.StorageClass))
 }

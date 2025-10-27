@@ -1,9 +1,10 @@
 module github.com/openshift/lightspeed-operator
 
-go 1.24.0
+go 1.24.1
 
 require (
 	github.com/Jeffail/gabs/v2 v2.7.0
+	github.com/cloudnative-pg/api v1.27.0
 	github.com/go-logr/logr v1.4.3
 	github.com/onsi/ginkgo/v2 v2.26.0
 	github.com/onsi/gomega v1.38.2
@@ -18,6 +19,8 @@ require (
 require (
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
 	github.com/blang/semver/v4 v4.0.0 // indirect
+	github.com/cloudnative-pg/barman-cloud v0.3.3 // indirect
+	github.com/cloudnative-pg/machinery v0.3.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/go-openapi/swag/cmdutils v0.25.1 // indirect

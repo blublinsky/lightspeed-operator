@@ -15,6 +15,7 @@ import (
 
 	"github.com/onsi/ginkgo/v2"
 
+	cnpgv1 "github.com/cloudnative-pg/api/pkg/api/v1"
 	consolev1 "github.com/openshift/api/console/v1"
 	openshiftv1 "github.com/openshift/api/operator/v1"
 	routev1 "github.com/openshift/api/route/v1"
@@ -91,6 +92,7 @@ func GetClient(options *ClientOptions) (*Client, error) {
 	utilruntime.Must(openshiftv1.AddToScheme(scheme))
 	utilruntime.Must(olsv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(routev1.AddToScheme(scheme))
+	utilruntime.Must(cnpgv1.AddToScheme(scheme))
 	// Create a new client
 	k8sClient, err := client.New(cfg, client.Options{
 		Scheme: scheme,

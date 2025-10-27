@@ -45,6 +45,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	cnpgv1 "github.com/cloudnative-pg/api/pkg/api/v1"
 	configv1 "github.com/openshift/api/config/v1"
 	monv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 
@@ -79,6 +80,7 @@ func init() {
 	utilruntime.Must(configv1.AddToScheme(scheme))
 
 	utilruntime.Must(olsv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(cnpgv1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 

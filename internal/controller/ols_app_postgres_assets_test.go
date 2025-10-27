@@ -557,3 +557,189 @@ func getNoCacheCR() *olsv1alpha1.OLSConfig {
 		},
 	}
 }
+
+// CloudNativePG Cluster Generator Tests
+var _ = Describe("CloudNativePG Cluster Generator", func() {
+	var reconciler *OLSConfigReconciler
+	var cr *olsv1alpha1.OLSConfig
+
+	BeforeEach(func() {
+		reconciler = &OLSConfigReconciler{
+			Options: OLSConfigReconcilerOptions{
+				Namespace: "test-namespace",
+			},
+		}
+
+		cr = &olsv1alpha1.OLSConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-ols-config",
+				Namespace: "test-namespace",
+			},
+			Spec: olsv1alpha1.OLSConfigSpec{
+				OLSConfig: olsv1alpha1.OLSSpec{
+					ConversationCache: olsv1alpha1.ConversationCacheSpec{
+						Postgres: olsv1alpha1.PostgresSpec{
+							User:              "testuser",
+							DbName:            "testdb",
+							CredentialsSecret: "test-secret",
+							SharedBuffers:     "512MB",
+							MaxConnections:    1000,
+						},
+					},
+					Storage: &olsv1alpha1.Storage{
+						Size:  resource.MustParse("2Gi"),
+						Class: "fast-ssd",
+					},
+				},
+			},
+		}
+	})
+
+	Context("when generating CloudNativePG cluster", func() {
+		It("should create cluster with correct basic configuration", func() {
+			cluster, err := reconciler.generateCloudNativePGCluster(cr)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(cluster.Name).To(Equal("lightspeed-postgres-cluster"))
+			Expect(cluster.Namespace).To(Equal("test-namespace"))
+			Expect(cluster.Spec.Instances).To(Equal(2))
+			Expect(cluster.Labels).To(HaveKeyWithValue("app.kubernetes.io/component", "postgres-server"))
+			Expect(cluster.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "lightspeed-operator"))
+			Expect(cluster.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", "lightspeed-service-postgres"))
+			Expect(cluster.Labels).To(HaveKeyWithValue("app.kubernetes.io/part-of", "openshift-lightspeed"))
+		})
+
+		It("should configure PostgreSQL parameters correctly", func() {
+			cluster, err := reconciler.generateCloudNativePGCluster(cr)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Verify PostgreSQL parameters
+			Expect(cluster.Spec.PostgresConfiguration.Parameters).To(HaveKeyWithValue("ssl", "on"))
+			Expect(cluster.Spec.PostgresConfiguration.Parameters).To(HaveKeyWithValue("shared_buffers", "512MB"))
+			Expect(cluster.Spec.PostgresConfiguration.Parameters).To(HaveKeyWithValue("max_connections", "1000"))
+		})
+
+		It("should configure bootstrap correctly", func() {
+			cluster, err := reconciler.generateCloudNativePGCluster(cr)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Verify bootstrap configuration uses PostgresSpec values
+			Expect(cluster.Spec.Bootstrap.InitDB.Database).To(Equal(cr.Spec.OLSConfig.ConversationCache.Postgres.DbName))
+			Expect(cluster.Spec.Bootstrap.InitDB.Owner).To(Equal(cr.Spec.OLSConfig.ConversationCache.Postgres.User))
+			Expect(cluster.Spec.Bootstrap.InitDB.Secret.Name).To(Equal(cr.Spec.OLSConfig.ConversationCache.Postgres.CredentialsSecret))
+		})
+
+		It("should configure storage correctly", func() {
+			cluster, err := reconciler.generateCloudNativePGCluster(cr)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Verify storage configuration
+			Expect(cluster.Spec.StorageConfiguration.Size).To(Equal("2Gi"))
+			Expect(cluster.Spec.StorageConfiguration.StorageClass).ToNot(BeNil())
+			Expect(*cluster.Spec.StorageConfiguration.StorageClass).To(Equal("fast-ssd"))
+		})
+
+		It("should configure certificates correctly", func() {
+			cluster, err := reconciler.generateCloudNativePGCluster(cr)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Verify certificate configuration
+			Expect(cluster.Spec.Certificates).ToNot(BeNil())
+			Expect(cluster.Spec.Certificates.ServerTLSSecret).To(Equal(PostgresCertsSecretName))
+		})
+
+		It("should configure resources correctly", func() {
+			cluster, err := reconciler.generateCloudNativePGCluster(cr)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Verify resource configuration
+			Expect(cluster.Spec.Resources.Requests).To(HaveKeyWithValue(corev1.ResourceCPU, resource.MustParse("30m")))
+			Expect(cluster.Spec.Resources.Requests).To(HaveKeyWithValue(corev1.ResourceMemory, resource.MustParse("300Mi")))
+			Expect(cluster.Spec.Resources.Limits).To(HaveKeyWithValue(corev1.ResourceMemory, resource.MustParse("2Gi")))
+		})
+
+		It("should use custom resources if specified", func() {
+			customCPU := resource.MustParse("100m")
+			customMemory := resource.MustParse("500Mi")
+			cr.Spec.OLSConfig.DeploymentConfig.DatabaseContainer.Resources = &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    customCPU,
+					corev1.ResourceMemory: customMemory,
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("500m"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+			}
+			cluster, err := reconciler.generateCloudNativePGCluster(cr)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(cluster.Spec.Resources.Requests).To(HaveKeyWithValue(corev1.ResourceCPU, customCPU))
+			Expect(cluster.Spec.Resources.Requests).To(HaveKeyWithValue(corev1.ResourceMemory, customMemory))
+			Expect(cluster.Spec.Resources.Limits).To(HaveKeyWithValue(corev1.ResourceCPU, resource.MustParse("500m")))
+			Expect(cluster.Spec.Resources.Limits).To(HaveKeyWithValue(corev1.ResourceMemory, resource.MustParse("1Gi")))
+		})
+
+		It("should configure node affinity when node selector specified", func() {
+			// Set node selector
+			cr.Spec.OLSConfig.DeploymentConfig.DatabaseContainer.NodeSelector = map[string]string{
+				"kubernetes.io/os": "linux",
+				"node-type":        "database",
+			}
+
+			cluster, err := reconciler.generateCloudNativePGCluster(cr)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Verify node affinity is configured
+			Expect(cluster.Spec.Affinity.NodeAffinity).ToNot(BeNil())
+			Expect(cluster.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution).ToNot(BeNil())
+		})
+
+		It("should handle tolerations when specified", func() {
+			// Set tolerations
+			cr.Spec.OLSConfig.DeploymentConfig.DatabaseContainer.Tolerations = []corev1.Toleration{
+				{
+					Key:      "database",
+					Operator: corev1.TolerationOpEqual,
+					Value:    "true",
+					Effect:   corev1.TaintEffectNoSchedule,
+				},
+			}
+
+			cluster, err := reconciler.generateCloudNativePGCluster(cr)
+			Expect(err).ToNot(HaveOccurred())
+
+			// CloudNativePG handles tolerations through affinity, so we just verify the cluster is created
+			Expect(cluster).ToNot(BeNil())
+			Expect(cluster.Name).To(Equal("lightspeed-postgres-cluster"))
+		})
+
+		It("should use default values when not specified", func() {
+			// Create CR with minimal configuration
+			minimalCR := &olsv1alpha1.OLSConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "minimal-ols-config",
+					Namespace: "test-namespace",
+				},
+				Spec: olsv1alpha1.OLSConfigSpec{
+					OLSConfig: olsv1alpha1.OLSSpec{
+						ConversationCache: olsv1alpha1.ConversationCacheSpec{
+							Postgres: olsv1alpha1.PostgresSpec{},
+						},
+					},
+				},
+			}
+
+			cluster, err := reconciler.generateCloudNativePGCluster(minimalCR)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Verify default values are used
+			Expect(cluster.Spec.PostgresConfiguration.Parameters).To(HaveKeyWithValue("shared_buffers", PostgresSharedBuffers))
+			Expect(cluster.Spec.PostgresConfiguration.Parameters).To(HaveKeyWithValue("max_connections", strconv.Itoa(PostgresMaxConnections)))
+			Expect(cluster.Spec.StorageConfiguration.Size).To(Equal(PostgresDefaultPVCSize))
+
+			// Verify default bootstrap values are used
+			Expect(cluster.Spec.Bootstrap.InitDB.Database).To(Equal(PostgresDefaultDbName))
+			Expect(cluster.Spec.Bootstrap.InitDB.Owner).To(Equal(PostgresDefaultUser))
+			Expect(cluster.Spec.Bootstrap.InitDB.Secret.Name).To(Equal(PostgresSecretName))
+		})
+	})
+})
